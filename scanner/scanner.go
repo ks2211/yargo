@@ -199,9 +199,32 @@ func (r *Rules) collectMatches(buf []byte) map[int]map[string][]matchInfo {
 		}
 		positions = dedupe(positions)
 
-		for _, pos := range positions {
+		// Dense hits share most of their windows. One pass over a run of
+		// overlapping windows rules them all out when nothing in it matches,
+		// and otherwise gives the leftmost place a window match can start.
+		runEnd, floor := 0, -1
+		for i, pos := range positions {
 			start := max(0, pos-halfWindow)
 			end := min(len(buf), pos+halfWindow)
+
+			if i >= runEnd {
+				runEnd = i + 1
+				for runEnd < len(positions) && positions[runEnd]-positions[runEnd-1] < halfWindow {
+					runEnd++
+				}
+				floor = 0
+				if runEnd-i > 2 {
+					last := min(len(buf), positions[runEnd-1]+halfWindow)
+					if loc := recoverFindIndex(re, buf[start:last]); loc != nil {
+						floor = start + loc[0]
+					} else {
+						floor = -1
+					}
+				}
+			}
+			if floor < 0 || end <= floor {
+				continue
+			}
 
 			if loc := recoverFindIndex(re, buf[start:end]); loc != nil {
 				matchStart := start + loc[0]
