@@ -3,6 +3,7 @@ package scanner
 import (
 	"bytes"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -262,9 +263,9 @@ func TestBase64Modifier(t *testing.T) {
 		data []byte
 		want bool
 	}{
-		{"rotation0", []byte("data: c2VjcmV0"), true},   // "secret" at position 0 mod 3
-		{"rotation1", []byte("data: AHNlY3JldA"), true}, // ?secret -> base64 -> skip 2 chars
-		{"rotation2", []byte("data: AAc2VjcmV0"), true}, // ??secret -> base64 -> skip 4 chars
+		{"rotation0", []byte("data: c2VjcmV0"), true},     // "secret" at position 0 mod 3
+		{"rotation1", []byte("data: AHNlY3JldA"), true},   // ?secret -> base64 -> skip 2 chars
+		{"rotation2", []byte("data: QUJzZWNyZXQ="), true}, // "ABsecret" -> base64 -> pad-2 pattern (skip 3 chars)
 		{"no_match", []byte("data: not_encoded"), false},
 	}
 
@@ -361,6 +362,300 @@ func TestTimeout(t *testing.T) {
 	}
 }
 
+func TestZeroTimeoutMeansNoTimeout(t *testing.T) {
+	rs := &ast.RuleSet{
+		Rules: []*ast.Rule{
+			{
+				Name: "test",
+				Strings: []*ast.StringDef{
+					{Name: "$s", Value: ast.TextString{Value: "test"}},
+				},
+				Condition: ast.AnyOf{Pattern: "them"},
+			},
+		},
+	}
+
+	rules, err := Compile(rs)
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+
+	var matches MatchRules
+	if err := rules.ScanMem([]byte("test data"), 0, 0, &matches); err != nil {
+		t.Fatalf("ScanMem() with zero timeout error = %v", err)
+	}
+	if len(matches) != 1 {
+		t.Errorf("expected 1 match with zero timeout, got %d", len(matches))
+	}
+}
+
+func TestCompileSkipsUnsupportedModifierRules(t *testing.T) {
+	rs, err := parser.New().Parse(`
+rule widerule {
+	strings:
+		$a = "needle" wide
+	condition:
+		any of them
+}
+
+rule xorrule {
+	strings:
+		$a = "needle"
+		$b = "other" xor(0x01-0xff)
+	condition:
+		any of them
+}
+
+rule plain {
+	strings:
+		$a = "needle"
+	condition:
+		any of them
+}
+
+rule private_rule {
+	strings:
+		$a = "needle" private
+	condition:
+		$a
+}`)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	rules, err := Compile(rs)
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+	if got := rules.NumRules(); got != 2 {
+		t.Errorf("expected 2 compiled rules, got %d", got)
+	}
+
+	// a rule with an unsupported modifier must not match at all, even via
+	// its supported strings: honoring only part of the rule could flip
+	// negated conditions and cause false positives
+	var matches MatchRules
+	if err := rules.ScanMem([]byte("some needle here"), 0, time.Second, &matches); err != nil {
+		t.Fatalf("ScanMem() error = %v", err)
+	}
+	if len(matches) != 2 {
+		t.Fatalf("expected 2 matches, got %v", matches)
+	}
+	if matches[0].Rule != "plain" {
+		t.Errorf("expected first match to be plain, got %q", matches[0].Rule)
+	}
+	if matches[1].Rule != "private_rule" {
+		t.Errorf("expected second match to be private_rule, got %q", matches[1].Rule)
+	}
+	if len(matches[1].Strings) != 0 {
+		t.Errorf("expected private_rule to suppress private string matches, got %v", matches[1].Strings)
+	}
+}
+
+func TestCompilePreservesPrivateStringMetadata(t *testing.T) {
+	rs := &ast.RuleSet{
+		Rules: []*ast.Rule{{
+			Name: "private_meta",
+			Strings: []*ast.StringDef{
+				{Name: "$public", Value: ast.TextString{Value: "visible"}},
+				{Name: "$secret", Value: ast.TextString{Value: "needle"}, Modifiers: ast.StringModifiers{Private: true}},
+			},
+			Condition: ast.AnyOf{Pattern: "them"},
+		}},
+	}
+
+	rules, err := Compile(rs)
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+	if got := rules.rules[0].stringPrivates; !slices.Equal(got, []bool{false, true}) {
+		t.Errorf("compiled private metadata = %v, want [false true]", got)
+	}
+}
+
+func TestPrivateStringMatchRuleContainsNoPrivateStrings(t *testing.T) {
+	rs, err := parser.New().Parse(`
+rule private_only {
+	strings:
+		$secret = "needle" private
+	condition:
+		$secret
+}`)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	rules, err := Compile(rs)
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+
+	var matches MatchRules
+	if err := rules.ScanMem([]byte("haystack needle haystack"), 0, time.Second, &matches); err != nil {
+		t.Fatalf("ScanMem() error = %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected 1 match, got %d", len(matches))
+	}
+	if matches[0].Rule != "private_only" {
+		t.Fatalf("matched rule = %q, want private_only", matches[0].Rule)
+	}
+	if len(matches[0].Strings) != 0 {
+		t.Errorf("expected private-only match to report no strings, got %v", matches[0].Strings)
+	}
+}
+
+func TestMixedRuleMatchRuleOmitsPrivateStrings(t *testing.T) {
+	rs, err := parser.New().Parse(`
+rule mixed_private {
+	strings:
+		$public = "visible"
+		$secret = "needle" private
+	condition:
+		$public and $secret
+}`)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	rules, err := Compile(rs)
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+
+	var matches MatchRules
+	if err := rules.ScanMem([]byte("visible needle"), 0, time.Second, &matches); err != nil {
+		t.Fatalf("ScanMem() error = %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected 1 match, got %d", len(matches))
+	}
+	if matches[0].Rule != "mixed_private" {
+		t.Fatalf("matched rule = %q, want mixed_private", matches[0].Rule)
+	}
+	if len(matches[0].Strings) != 1 {
+		t.Fatalf("expected only the public string to be reported, got %v", matches[0].Strings)
+	}
+	if matches[0].Strings[0].Name != "$public" {
+		t.Errorf("reported string = %q, want $public", matches[0].Strings[0].Name)
+	}
+	if string(matches[0].Strings[0].Data) != "visible" {
+		t.Errorf("reported data = %q, want visible", matches[0].Strings[0].Data)
+	}
+}
+
+func TestRegexFullword(t *testing.T) {
+	rs, err := parser.New().Parse(`rule fw { strings: $re = /abc[0-9]+/ fullword condition: any of them }`)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	rules, err := Compile(rs)
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+
+	tests := []struct {
+		data string
+		want int
+	}{
+		{"abc123", 1},
+		{" abc123.", 1},
+		{"xabc123", 0},
+		{"abc123x", 0},
+	}
+	for _, tt := range tests {
+		var matches MatchRules
+		if err := rules.ScanMem([]byte(tt.data), 0, time.Second, &matches); err != nil {
+			t.Fatalf("ScanMem(%q) error = %v", tt.data, err)
+		}
+		if len(matches) != tt.want {
+			t.Errorf("ScanMem(%q): expected %d matches, got %d", tt.data, tt.want, len(matches))
+		}
+	}
+}
+
+func TestRegexMultipleOccurrences(t *testing.T) {
+	rs, err := parser.New().Parse(`rule multi { strings: $re = /abc[0-9]+/ condition: any of them }`)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	rules, err := Compile(rs)
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+
+	data := make([]byte, 106)
+	for i := range data {
+		data[i] = '-'
+	}
+	copy(data[0:], "abc111")
+	copy(data[100:], "abc222")
+
+	var matches MatchRules
+	if err := rules.ScanMem(data, 0, time.Second, &matches); err != nil {
+		t.Fatalf("ScanMem() error = %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected 1 matching rule, got %d", len(matches))
+	}
+	if len(matches[0].Strings) != 2 {
+		t.Fatalf("expected 2 recorded occurrences, got %d: %v", len(matches[0].Strings), matches[0].Strings)
+	}
+	got := map[string]bool{}
+	for _, s := range matches[0].Strings {
+		got[string(s.Data)] = true
+	}
+	if !got["abc111"] || !got["abc222"] {
+		t.Errorf("expected occurrences abc111 and abc222, got %v", matches[0].Strings)
+	}
+}
+
+func TestRegexAtSecondOccurrence(t *testing.T) {
+	rs, err := parser.New().Parse(`rule at2 { strings: $re = /abc[0-9]+/ condition: $re at 100 }`)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	rules, err := Compile(rs)
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+
+	data := make([]byte, 106)
+	for i := range data {
+		data[i] = '-'
+	}
+	copy(data[0:], "abc111")
+	copy(data[100:], "abc222")
+
+	var matches MatchRules
+	if err := rules.ScanMem(data, 0, time.Second, &matches); err != nil {
+		t.Fatalf("ScanMem() error = %v", err)
+	}
+	if len(matches) != 1 {
+		t.Errorf("expected rule to match on second occurrence at 100, got %d matches", len(matches))
+	}
+}
+
+func TestAlternationBranchWithoutAtom(t *testing.T) {
+	rs, err := parser.New().Parse(`rule uncovered { strings: $re = /return|malwarefunc/ condition: any of them }`)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if _, err := Compile(rs); err == nil {
+		t.Error("expected compile error for alternation branch without a usable atom")
+	}
+
+	rules, err := CompileWithOptions(rs, CompileOptions{SkipInvalidRegex: true})
+	if err != nil {
+		t.Fatalf("CompileWithOptions() error = %v", err)
+	}
+	var matches MatchRules
+	if err := rules.ScanMem([]byte("this contains return only"), 0, time.Second, &matches); err != nil {
+		t.Fatalf("ScanMem() error = %v", err)
+	}
+	if len(matches) != 0 {
+		t.Errorf("expected skipped string to never match, got %d matches", len(matches))
+	}
+}
+
 func TestEmptyRuleset(t *testing.T) {
 	rs := &ast.RuleSet{
 		Rules: []*ast.Rule{},
@@ -409,6 +704,245 @@ func TestRuleWithNoStrings(t *testing.T) {
 	// Rule with no strings and "any of them" condition should not match
 	if len(matches) != 0 {
 		t.Errorf("expected 0 matches for rule with no strings, got %d", len(matches))
+	}
+}
+
+func TestRulesAreEvaluatedWithoutStringHits(t *testing.T) {
+	comparisonRule := func(name, op string, right int64) *ast.Rule {
+		return &ast.Rule{
+			Name: name,
+			Condition: ast.BinaryExpr{
+				Op:    op,
+				Left:  ast.FuncCall{Name: "uint8", Args: []ast.Expr{ast.IntLit{Value: 0}}},
+				Right: ast.IntLit{Value: right},
+			},
+		}
+	}
+
+	tests := []struct {
+		name string
+		rule *ast.Rule
+		data []byte
+	}{
+		{
+			name: "constant condition without strings",
+			rule: &ast.Rule{
+				Name:      "constant_true",
+				Condition: ast.IntLit{Value: 1},
+			},
+			data: []byte("any data"),
+		},
+		{name: "eq comparison without strings", rule: comparisonRule("gif_eq", "==", 0x47), data: []byte("GIF")},
+		{name: "ne comparison without strings", rule: comparisonRule("gif_ne", "!=", 0x46), data: []byte("GIF")},
+		{name: "lt comparison without strings", rule: comparisonRule("gif_lt", "<", 0x48), data: []byte("GIF")},
+		{name: "gt comparison without strings", rule: comparisonRule("gif_gt", ">", 0x46), data: []byte("GIF")},
+		{name: "le comparison without strings", rule: comparisonRule("gif_le", "<=", 0x47), data: []byte("GIF")},
+		{name: "ge comparison without strings", rule: comparisonRule("gif_ge", ">=", 0x47), data: []byte("GIF")},
+		{
+			name: "true non-string branch without a string hit",
+			rule: &ast.Rule{
+				Name: "string_or_magic",
+				Strings: []*ast.StringDef{
+					{Name: "$a", Value: ast.TextString{Value: "not present"}},
+				},
+				Condition: ast.BinaryExpr{
+					Op:   "or",
+					Left: ast.StringRef{Name: "$a"},
+					Right: ast.BinaryExpr{
+						Op:    ">=",
+						Left:  ast.FuncCall{Name: "uint8", Args: []ast.Expr{ast.IntLit{Value: 0}}},
+						Right: ast.IntLit{Value: 0x47},
+					},
+				},
+			},
+			data: []byte("GIF"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rules, err := Compile(&ast.RuleSet{Rules: []*ast.Rule{tt.rule}})
+			if err != nil {
+				t.Fatalf("Compile() error = %v", err)
+			}
+
+			var matches MatchRules
+			if err := rules.ScanMem(tt.data, 0, time.Second, &matches); err != nil {
+				t.Fatalf("ScanMem() error = %v", err)
+			}
+
+			if len(matches) != 1 {
+				t.Fatalf("expected 1 match, got %d", len(matches))
+			}
+			if matches[0].Rule != tt.rule.Name {
+				t.Errorf("matched rule = %q, want %q", matches[0].Rule, tt.rule.Name)
+			}
+			if len(matches[0].Strings) != 0 {
+				t.Errorf("expected no matching strings, got %d", len(matches[0].Strings))
+			}
+		})
+	}
+}
+
+func TestScanFilesizeWithoutStrings(t *testing.T) {
+	rs, err := parser.New().Parse(`
+		rule size_eq {
+			condition:
+				filesize == 3
+		}
+
+		rule size_truthy {
+			condition:
+				filesize
+		}
+	`)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	rules, err := Compile(rs)
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+
+	var matches MatchRules
+	if err := rules.ScanMem([]byte("abc"), 0, time.Second, &matches); err != nil {
+		t.Fatalf("ScanMem() error = %v", err)
+	}
+	if len(matches) != 2 {
+		t.Fatalf("expected 2 matches, got %d", len(matches))
+	}
+	if matches[0].Rule != "size_eq" || matches[1].Rule != "size_truthy" {
+		t.Fatalf("matches = %+v, want size_eq then size_truthy", matches)
+	}
+	for _, match := range matches {
+		if len(match.Strings) != 0 {
+			t.Errorf("rule %q matched strings = %v, want none", match.Rule, match.Strings)
+		}
+	}
+
+	matches = nil
+	if err := rules.ScanMem(nil, 0, time.Second, &matches); err != nil {
+		t.Fatalf("ScanMem() on empty buffer error = %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("expected 0 matches on empty buffer, got %d", len(matches))
+	}
+}
+
+func TestScanFilesizeWithoutStringHits(t *testing.T) {
+	rs, err := parser.New().Parse(`
+		rule size_only {
+			strings:
+				$a = "needle"
+			condition:
+				filesize == 3
+		}
+	`)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	rules, err := Compile(rs)
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+
+	var matches MatchRules
+	if err := rules.ScanMem([]byte("abc"), 0, time.Second, &matches); err != nil {
+		t.Fatalf("ScanMem() error = %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected 1 match, got %d", len(matches))
+	}
+	if matches[0].Rule != "size_only" {
+		t.Fatalf("matched rule = %q, want size_only", matches[0].Rule)
+	}
+	if len(matches[0].Strings) != 0 {
+		t.Errorf("matched strings = %v, want none", matches[0].Strings)
+	}
+}
+
+func TestScanNotCondition(t *testing.T) {
+	rs, err := parser.New().Parse(`
+		rule string_absent {
+			strings:
+				$a = "needle"
+			condition:
+				not $a
+		}
+	`)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	rules, err := Compile(rs)
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+
+	var absentMatches MatchRules
+	if err := rules.ScanMem([]byte("haystack"), 0, time.Second, &absentMatches); err != nil {
+		t.Fatalf("ScanMem() without string error = %v", err)
+	}
+	if len(absentMatches) != 1 || absentMatches[0].Rule != "string_absent" {
+		t.Fatalf("matches without string = %+v, want string_absent", absentMatches)
+	}
+	if len(absentMatches[0].Strings) != 0 {
+		t.Errorf("matching strings = %v, want none", absentMatches[0].Strings)
+	}
+
+	var presentMatches MatchRules
+	if err := rules.ScanMem([]byte("contains needle"), 0, time.Second, &presentMatches); err != nil {
+		t.Fatalf("ScanMem() with string error = %v", err)
+	}
+	if len(presentMatches) != 0 {
+		t.Errorf("matches with string = %+v, want none", presentMatches)
+	}
+}
+
+func TestRulesWithAndWithoutHitsKeepCompilationOrder(t *testing.T) {
+	byteCheck := ast.BinaryExpr{
+		Op:    ">=",
+		Left:  ast.FuncCall{Name: "uint8", Args: []ast.Expr{ast.IntLit{Value: 0}}},
+		Right: ast.IntLit{Value: 0x47},
+	}
+	rs := &ast.RuleSet{Rules: []*ast.Rule{
+		{Name: "before", Condition: ast.IntLit{Value: 1}},
+		{
+			Name:      "string_hit",
+			Strings:   []*ast.StringDef{{Name: "$a", Value: ast.TextString{Value: "GIF"}}},
+			Condition: ast.StringRef{Name: "$a"},
+		},
+		{
+			Name:    "hit_and_hitless_candidate",
+			Strings: []*ast.StringDef{{Name: "$a", Value: ast.TextString{Value: "GIF"}}},
+			Condition: ast.BinaryExpr{
+				Op:    "or",
+				Left:  ast.StringRef{Name: "$a"},
+				Right: byteCheck,
+			},
+		},
+		{Name: "after", Condition: byteCheck},
+	}}
+
+	rules, err := Compile(rs)
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+
+	var matches MatchRules
+	if err := rules.ScanMem([]byte("GIF"), 0, time.Second, &matches); err != nil {
+		t.Fatalf("ScanMem() error = %v", err)
+	}
+
+	got := make([]string, len(matches))
+	for i, match := range matches {
+		got[i] = match.Rule
+	}
+	want := []string{"before", "string_hit", "hit_and_hitless_candidate", "after"}
+	if !slices.Equal(got, want) {
+		t.Errorf("matched rules = %v, want %v", got, want)
 	}
 }
 
@@ -517,6 +1051,260 @@ func TestFullwordModifier(t *testing.T) {
 			got := len(matches) > 0
 			if got != tt.want {
 				t.Errorf("match = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNocaseModifier(t *testing.T) {
+	rs := &ast.RuleSet{
+		Rules: []*ast.Rule{
+			{
+				Name: "nocase_test",
+				Strings: []*ast.StringDef{
+					{
+						Name:      "$s",
+						Value:     ast.TextString{Value: "evil.com"},
+						Modifiers: ast.StringModifiers{Nocase: true},
+					},
+				},
+				Condition: ast.AnyOf{Pattern: "them"},
+			},
+		},
+	}
+
+	rules, err := Compile(rs)
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+
+	tests := []struct {
+		name string
+		data []byte
+		want bool
+	}{
+		{"lowercase", []byte("visit evil.com today"), true},
+		{"uppercase", []byte("visit EVIL.COM today"), true},
+		{"mixed_case", []byte("visit Evil.Com today"), true},
+		{"random_case", []byte("visit eViL.cOm today"), true},
+		{"no_match", []byte("visit good.com today"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var matches MatchRules
+			err = rules.ScanMem(tt.data, 0, time.Second, &matches)
+			if err != nil {
+				t.Fatalf("ScanMem() error = %v", err)
+			}
+			got := len(matches) > 0
+			if got != tt.want {
+				t.Errorf("match = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNocaseFullword(t *testing.T) {
+	rs := &ast.RuleSet{
+		Rules: []*ast.Rule{
+			{
+				Name: "nocase_fullword_test",
+				Strings: []*ast.StringDef{
+					{
+						Name:      "$s",
+						Value:     ast.TextString{Value: "evil.com"},
+						Modifiers: ast.StringModifiers{Nocase: true, Fullword: true},
+					},
+				},
+				Condition: ast.AnyOf{Pattern: "them"},
+			},
+		},
+	}
+
+	rules, err := Compile(rs)
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+
+	tests := []struct {
+		name string
+		data []byte
+		want bool
+	}{
+		{"lowercase_fullword", []byte("visit evil.com today"), true},
+		{"uppercase_fullword", []byte("visit EVIL.COM today"), true},
+		{"mixed_fullword", []byte("visit Evil.Com today"), true},
+		{"embedded_no_match", []byte("notevil.comstuff"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var matches MatchRules
+			err = rules.ScanMem(tt.data, 0, time.Second, &matches)
+			if err != nil {
+				t.Fatalf("ScanMem() error = %v", err)
+			}
+			got := len(matches) > 0
+			if got != tt.want {
+				t.Errorf("match = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNocaseWithCaseSensitiveRule(t *testing.T) {
+	// ensure nocase doesn't affect case-sensitive rules in the same ruleset
+	rs := &ast.RuleSet{
+		Rules: []*ast.Rule{
+			{
+				Name: "case_sensitive",
+				Strings: []*ast.StringDef{
+					{Name: "$s", Value: ast.TextString{Value: "secret"}},
+				},
+				Condition: ast.AnyOf{Pattern: "them"},
+			},
+			{
+				Name: "case_insensitive",
+				Strings: []*ast.StringDef{
+					{
+						Name:      "$s",
+						Value:     ast.TextString{Value: "password"},
+						Modifiers: ast.StringModifiers{Nocase: true},
+					},
+				},
+				Condition: ast.AnyOf{Pattern: "them"},
+			},
+		},
+	}
+
+	rules, err := Compile(rs)
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+
+	data := []byte("PASSWORD but no SECRET here")
+	var matches MatchRules
+	err = rules.ScanMem(data, 0, time.Second, &matches)
+	if err != nil {
+		t.Fatalf("ScanMem() error = %v", err)
+	}
+
+	// only "case_insensitive" should match (PASSWORD matches password nocase)
+	// "case_sensitive" should NOT match (no lowercase "secret")
+	if len(matches) != 1 {
+		t.Fatalf("expected 1 match, got %d: %v", len(matches), matches)
+	}
+	if matches[0].Rule != "case_insensitive" {
+		t.Errorf("expected case_insensitive rule, got %q", matches[0].Rule)
+	}
+}
+
+func TestNocaseEndToEnd(t *testing.T) {
+	rule := `rule test_nocase {
+		strings:
+			$ = "ApexPulse.org" fullword nocase
+		condition: any of them
+	}`
+	p := parser.New()
+	rs, err := p.Parse(rule)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	rules, err := Compile(rs)
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+
+	tests := []struct {
+		name string
+		data []byte
+		want bool
+	}{
+		{"original_case", []byte("visit ApexPulse.org now"), true},
+		{"lowercase", []byte("visit apexpulse.org now"), true},
+		{"uppercase", []byte("visit APEXPULSE.ORG now"), true},
+		{"random_case", []byte("visit aPeXpUlSe.OrG now"), true},
+		{"no_match", []byte("visit example.org now"), false},
+		{"fullword_boundary", []byte("notapexpulse.org"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var matches MatchRules
+			err = rules.ScanMem(tt.data, 0, time.Second, &matches)
+			if err != nil {
+				t.Fatalf("ScanMem() error = %v", err)
+			}
+			got := len(matches) > 0
+			if got != tt.want {
+				t.Errorf("match = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNocaseDoesNotAffectRegex(t *testing.T) {
+	// regex verification must use the original buffer, not the lowered one.
+	// a case-sensitive regex like /[a-z]+/ must not match uppercase input
+	// just because another pattern in the ruleset uses nocase.
+	rule := `rule regex_case {
+		strings:
+			$re = /[a-z]{4}\.com/
+		condition: any of them
+	}
+	rule nocase_text {
+		strings:
+			$s = "trigger" nocase
+		condition: any of them
+	}`
+	p := parser.New()
+	rs, err := p.Parse(rule)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	rules, err := Compile(rs)
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		data      []byte
+		wantRules []string
+	}{
+		{
+			"regex matches lowercase, nocase matches uppercase",
+			[]byte("TRIGGER evil.com"),
+			[]string{"nocase_text", "regex_case"},
+		},
+		{
+			"regex should not match uppercase",
+			[]byte("TRIGGER EVIL.COM"),
+			[]string{"nocase_text"},
+		},
+		{
+			"only regex matches",
+			[]byte("test.com"),
+			[]string{"regex_case"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var matches MatchRules
+			err = rules.ScanMem(tt.data, 0, time.Second, &matches)
+			if err != nil {
+				t.Fatalf("ScanMem() error = %v", err)
+			}
+			got := make([]string, len(matches))
+			for i, m := range matches {
+				got[i] = m.Rule
+			}
+			slices.Sort(got)
+			slices.Sort(tt.wantRules)
+			if !slices.Equal(got, tt.wantRules) {
+				t.Errorf("matched rules = %v, want %v", got, tt.wantRules)
 			}
 		})
 	}
@@ -1309,6 +2097,103 @@ func TestAllOfThemCondition(t *testing.T) {
 	}
 }
 
+func TestAllOfThemAnonymousStrings(t *testing.T) {
+	rs := &ast.RuleSet{
+		Rules: []*ast.Rule{
+			{
+				Name: "all_anon",
+				Strings: []*ast.StringDef{
+					{Name: "$", Value: ast.TextString{Value: "foo"}},
+					{Name: "$", Value: ast.TextString{Value: "bar"}},
+					{Name: "$", Value: ast.TextString{Value: "baz"}},
+				},
+				Condition: ast.AllOf{Pattern: "them"},
+			},
+		},
+	}
+
+	rules, err := Compile(rs)
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+
+	// All three present: should match
+	data := []byte("foo bar baz")
+	var matches MatchRules
+	err = rules.ScanMem(data, 0, time.Second, &matches)
+	if err != nil {
+		t.Fatalf("ScanMem() error = %v", err)
+	}
+	if len(matches) != 1 {
+		t.Errorf("expected 1 match when all strings present, got %d", len(matches))
+	}
+
+	// Only one present: must NOT match
+	data2 := []byte("foo only")
+	var matches2 MatchRules
+	err = rules.ScanMem(data2, 0, time.Second, &matches2)
+	if err != nil {
+		t.Fatalf("ScanMem() error = %v", err)
+	}
+	if len(matches2) != 0 {
+		t.Errorf("expected 0 matches when only one anonymous string present, got %d", len(matches2))
+	}
+
+	// Two of three present: must NOT match
+	data3 := []byte("foo bar")
+	var matches3 MatchRules
+	err = rules.ScanMem(data3, 0, time.Second, &matches3)
+	if err != nil {
+		t.Fatalf("ScanMem() error = %v", err)
+	}
+	if len(matches3) != 0 {
+		t.Errorf("expected 0 matches when only 2 of 3 anonymous strings present, got %d", len(matches3))
+	}
+}
+
+func TestAnyOfThemAnonymousStrings(t *testing.T) {
+	rs := &ast.RuleSet{
+		Rules: []*ast.Rule{
+			{
+				Name: "any_anon",
+				Strings: []*ast.StringDef{
+					{Name: "$", Value: ast.TextString{Value: "foo"}},
+					{Name: "$", Value: ast.TextString{Value: "bar"}},
+					{Name: "$", Value: ast.TextString{Value: "baz"}},
+				},
+				Condition: ast.AnyOf{Pattern: "them"},
+			},
+		},
+	}
+
+	rules, err := Compile(rs)
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+
+	// One present: should match
+	data := []byte("bar only")
+	var matches MatchRules
+	err = rules.ScanMem(data, 0, time.Second, &matches)
+	if err != nil {
+		t.Fatalf("ScanMem() error = %v", err)
+	}
+	if len(matches) != 1 {
+		t.Errorf("expected 1 match when one anonymous string present, got %d", len(matches))
+	}
+
+	// None present: must NOT match
+	data2 := []byte("none here")
+	var matches2 MatchRules
+	err = rules.ScanMem(data2, 0, time.Second, &matches2)
+	if err != nil {
+		t.Fatalf("ScanMem() error = %v", err)
+	}
+	if len(matches2) != 0 {
+		t.Errorf("expected 0 matches when no anonymous string present, got %d", len(matches2))
+	}
+}
+
 func TestNoWarningForSupportedCondition(t *testing.T) {
 	rs := &ast.RuleSet{
 		Rules: []*ast.Rule{
@@ -1762,7 +2647,7 @@ func TestMatchOrderDeterministic(t *testing.T) {
 
 	data := []byte("this is a test string")
 
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		var matches MatchRules
 		err := rules.ScanMem(data, 0, time.Second, &matches)
 		if err != nil {
@@ -1844,6 +2729,89 @@ func TestScanFileMatchesScanMem(t *testing.T) {
 	}
 }
 
+func TestNocaseRegexRequiresFullScan(t *testing.T) {
+	// nocase on a regex means the same as the i flag, which yargo cannot
+	// prefilter with atoms — it must be reported, not silently under-matched
+	rule := `rule r {
+		strings:
+			$a = /foo[0-9]+/ nocase
+		condition: $a
+	}`
+	rs, err := parser.New().Parse(rule)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if _, err := Compile(rs); err == nil {
+		t.Fatal("Compile() should reject a nocase regex, got nil error")
+	}
+
+	if _, err := CompileWithOptions(rs, CompileOptions{SkipInvalidRegex: true}); err != nil {
+		t.Fatalf("CompileWithOptions() error = %v", err)
+	}
+}
+
+// When any nocase string exists the automaton folds case, so every
+// case-sensitive pattern must be confirmed against the original buffer.
+func TestNocaseDoesNotLeakIntoOtherPatternTypes(t *testing.T) {
+	rule := `rule folded {
+		strings:
+			$n = "password" nocase
+		condition: $n
+	}
+	rule hex_rule {
+		strings:
+			$h = { 41 42 43 44 }
+		condition: $h
+	}
+	rule regex_rule {
+		strings:
+			$r = /Payload[0-9]+/
+		condition: $r
+	}
+	rule binary_rule {
+		strings:
+			$b = { 01 02 03 04 }
+		condition: $b
+	}`
+	rs, err := parser.New().Parse(rule)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	rules, err := Compile(rs)
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+
+	tests := []struct {
+		name string
+		data string
+		want []string
+	}{
+		{"lowercased hex and regex must not match", "abcd payload42", nil},
+		{"exact case hex and regex match", "ABCD Payload42", []string{"hex_rule", "regex_rule"}},
+		{"nocase string still folds", "PaSsWoRd", []string{"folded"}},
+		{"letterless binary pattern is unaffected", "\x01\x02\x03\x04", []string{"binary_rule"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var matches MatchRules
+			if err := rules.ScanMem([]byte(tt.data), 0, time.Second, &matches); err != nil {
+				t.Fatalf("ScanMem() error = %v", err)
+			}
+			got := make([]string, len(matches))
+			for i, m := range matches {
+				got[i] = m.Rule
+			}
+			slices.Sort(got)
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("scanning %q matched %v, want %v", tt.data, got, tt.want)
+			}
+		})
+	}
+}
+
 type countingRegexp struct {
 	Regexp
 	calls *int
@@ -1879,26 +2847,39 @@ func TestDenseAtomHits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Compile() error = %v", err)
 	}
+	scan := func(input []byte) []string {
+		t.Helper()
+		var matches MatchRules
+		if err := rules.ScanMem(input, 0, 10*time.Second, &matches); err != nil {
+			t.Fatalf("ScanMem() error = %v", err)
+		}
+		var found []string
+		for _, m := range matches {
+			for _, s := range m.Strings {
+				found = append(found, string(s.Data))
+			}
+		}
+		return found
+	}
 
 	// Thousands of atom hits that never complete the pattern cost one pass, not one per hit.
 	noise := bytes.Repeat([]byte("secret.env "), 5000)
-	var matches MatchRules
-	if err := rules.ScanMem(noise, 0, 10*time.Second, &matches); err != nil {
-		t.Fatalf("ScanMem() error = %v", err)
-	}
-	if len(matches) != 0 {
-		t.Errorf("expected no match in noise, got %d", len(matches))
+	calls = 0
+	if found := scan(noise); len(found) != 0 {
+		t.Errorf("expected no match in noise, got %v", found)
 	}
 	if calls > 4 {
 		t.Errorf("dense hits with no match took %d regex calls", calls)
 	}
 
-	// A match at the far end of a dense run is still found, with its own text.
-	matches = nil
-	if err := rules.ScanMem(append(noise, []byte("secret.env=1234")...), 0, 10*time.Second, &matches); err != nil {
-		t.Fatalf("ScanMem() error = %v", err)
+	// Every match in a dense run is still found: at the start, in the middle and at the end.
+	input := slices.Concat([]byte("secret.env=1111 "), noise, []byte("secret.env=2222 "), noise, []byte("secret.env=3333"))
+	calls = 0
+	want := []string{"secret.env=1111", "secret.env=2222", "secret.env=3333"}
+	if found := scan(input); !slices.Equal(found, want) {
+		t.Errorf("matches in a dense run = %v, want %v", found, want)
 	}
-	if len(matches) != 1 || len(matches[0].Strings) != 1 || string(matches[0].Strings[0].Data) != "secret.env=1234" {
-		t.Errorf("match after a dense run not found: %+v", matches)
+	if calls > 16 {
+		t.Errorf("three matches in a dense run took %d regex calls", calls)
 	}
 }

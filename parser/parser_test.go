@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/sansecio/yargo/ast"
@@ -82,13 +83,13 @@ func TestParseHexStrings(t *testing.T) {
 	}{
 		{"bytes", "{ FF D8 }", []ast.HexToken{ast.HexByte{Value: 0xFF}, ast.HexByte{Value: 0xD8}}},
 		{"wildcard", "{ FF ?? D8 }", []ast.HexToken{ast.HexByte{Value: 0xFF}, ast.HexWildcard{}, ast.HexByte{Value: 0xD8}}},
-		{"jump exact", "{ FF [4] D8 }", []ast.HexToken{ast.HexByte{Value: 0xFF}, ast.HexJump{Min: intPtr(4), Max: intPtr(4)}, ast.HexByte{Value: 0xD8}}},
-		{"jump range", "{ FF [4-16] D8 }", []ast.HexToken{ast.HexByte{Value: 0xFF}, ast.HexJump{Min: intPtr(4), Max: intPtr(16)}, ast.HexByte{Value: 0xD8}}},
+		{"jump exact", "{ FF [4] D8 }", []ast.HexToken{ast.HexByte{Value: 0xFF}, ast.HexJump{Min: new(4), Max: new(4)}, ast.HexByte{Value: 0xD8}}},
+		{"jump range", "{ FF [4-16] D8 }", []ast.HexToken{ast.HexByte{Value: 0xFF}, ast.HexJump{Min: new(4), Max: new(16)}, ast.HexByte{Value: 0xD8}}},
 		{"jump unbounded", "{ FF [-] D8 }", []ast.HexToken{ast.HexByte{Value: 0xFF}, ast.HexJump{}, ast.HexByte{Value: 0xD8}}},
-		{"jump min only", "{ FF [4-] D8 }", []ast.HexToken{ast.HexByte{Value: 0xFF}, ast.HexJump{Min: intPtr(4)}, ast.HexByte{Value: 0xD8}}},
-		{"jump max only", "{ FF [-16] D8 }", []ast.HexToken{ast.HexByte{Value: 0xFF}, ast.HexJump{Max: intPtr(16)}, ast.HexByte{Value: 0xD8}}},
-		{"alternation", "{ FF (41|42) D8 }", []ast.HexToken{ast.HexByte{Value: 0xFF}, ast.HexAlt{Alternatives: []ast.HexAltItem{{Byte: bytePtr(0x41)}, {Byte: bytePtr(0x42)}}}, ast.HexByte{Value: 0xD8}}},
-		{"alt with wildcard", "{ (41|??) }", []ast.HexToken{ast.HexAlt{Alternatives: []ast.HexAltItem{{Byte: bytePtr(0x41)}, {Wildcard: true}}}}},
+		{"jump min only", "{ FF [4-] D8 }", []ast.HexToken{ast.HexByte{Value: 0xFF}, ast.HexJump{Min: new(4)}, ast.HexByte{Value: 0xD8}}},
+		{"jump max only", "{ FF [-16] D8 }", []ast.HexToken{ast.HexByte{Value: 0xFF}, ast.HexJump{Max: new(16)}, ast.HexByte{Value: 0xD8}}},
+		{"alternation", "{ FF (41|42) D8 }", []ast.HexToken{ast.HexByte{Value: 0xFF}, ast.HexAlt{Alternatives: []ast.HexAltItem{{Byte: new(byte(0x41))}, {Byte: new(byte(0x42))}}}, ast.HexByte{Value: 0xD8}}},
+		{"alt with wildcard", "{ (41|??) }", []ast.HexToken{ast.HexAlt{Alternatives: []ast.HexAltItem{{Byte: new(byte(0x41))}, {Wildcard: true}}}}},
 	}
 
 	for _, tt := range tests {
@@ -112,6 +113,8 @@ func TestParseRegex(t *testing.T) {
 		{`/pattern/sim`, "pattern"},
 		{`/foo\/bar/`, `foo\/bar`},
 		{`/\bword\b/i`, `\bword\b`},
+		{`/a[/]b/`, `a[/]b`},
+		{`/a[^/]+b/i`, `a[^/]+b`},
 	}
 
 	for _, tt := range tests {
@@ -127,40 +130,117 @@ func TestParseRegex(t *testing.T) {
 
 func TestParseModifiers(t *testing.T) {
 	tests := []struct {
-		input   string
-		mods    ast.StringModifiers
-		wantErr bool
+		input string
+		mods  ast.StringModifiers
 	}{
-		{`"x" base64`, ast.StringModifiers{Base64: true}, false},
-		{`"x" fullword`, ast.StringModifiers{Fullword: true}, false},
-		{`"x" base64 fullword`, ast.StringModifiers{Base64: true, Fullword: true}, false},
-		{`{ FF } base64`, ast.StringModifiers{Base64: true}, false},
-		{`"x" ascii`, ast.StringModifiers{Ascii: true}, false},
-		{`"x" wide`, ast.StringModifiers{}, true},
-		{`"x" nocase`, ast.StringModifiers{}, true},
-		{`"x" xor`, ast.StringModifiers{}, true},
-		{`"x" base64wide`, ast.StringModifiers{}, true},
-		{`"x" private`, ast.StringModifiers{}, true},
+		{`"x" base64`, ast.StringModifiers{Base64: true}},
+		{`"x" fullword`, ast.StringModifiers{Fullword: true}},
+		{`"x" base64 fullword`, ast.StringModifiers{Base64: true, Fullword: true}},
+		{`{ FF } base64`, ast.StringModifiers{Base64: true}},
+		{`"x" ascii`, ast.StringModifiers{Ascii: true}},
+		{`"x" nocase`, ast.StringModifiers{Nocase: true}},
+		{`"x" private`, ast.StringModifiers{Private: true}},
+		{`"x" wide`, ast.StringModifiers{Unsupported: []string{"wide"}}},
+		{`"x" xor`, ast.StringModifiers{Unsupported: []string{"xor"}}},
+		{`"x" base64wide`, ast.StringModifiers{Unsupported: []string{"base64wide"}}},
+		{`"x" wide xor nocase`, ast.StringModifiers{Nocase: true, Unsupported: []string{"wide", "xor"}}},
+		{`"x" xor(0x01-0xff)`, ast.StringModifiers{Unsupported: []string{"xor(0x01-0xff)"}}},
+		{`"x" xor ( 0x01 )`, ast.StringModifiers{Unsupported: []string{"xor( 0x01 )"}}},
+		{`"x" base64("!@#$%^&*(){}")`, ast.StringModifiers{Unsupported: []string{`base64("!@#$%^&*(){}")`}}},
+		{`"x" base64wide("abc") fullword`, ast.StringModifiers{Fullword: true, Unsupported: []string{`base64wide("abc")`}}},
+		{`"x" frobnicate`, ast.StringModifiers{Unsupported: []string{"frobnicate"}}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
 			p := New()
 			rs, err := p.Parse(`rule test { strings: $ = ` + tt.input + ` condition: any of them }`)
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("expected error for %q", tt.input)
-				}
-				return
-			}
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			got := rs.Rules[0].Strings[0].Modifiers
-			if got != tt.mods {
+			if !reflect.DeepEqual(got, tt.mods) {
 				t.Errorf("expected %+v, got %+v", tt.mods, got)
 			}
+			if len(tt.mods.Unsupported) == 0 && len(rs.Warnings) != 0 {
+				t.Errorf("expected no warnings, got %v", rs.Warnings)
+			}
+			if len(tt.mods.Unsupported) != len(rs.Warnings) {
+				t.Errorf("expected %d warnings, got %v", len(tt.mods.Unsupported), rs.Warnings)
+			}
 		})
+	}
+}
+
+func TestParseModifierWarnings(t *testing.T) {
+	rs := mustParse(t, `
+rule first {
+	strings:
+		$a = "one" wide nocase
+		$ = "two" xor(0x10-0x20)
+	condition:
+		any of them
+}
+
+rule second {
+	strings:
+		$b = "three" fullword private
+	condition:
+		any of them
+}`)
+
+	want := []string{
+		`rule "first" string $a: unsupported modifier "wide", rule will not match`,
+		`rule "first" string $: unsupported modifier "xor(0x10-0x20)", rule will not match`,
+	}
+	if !reflect.DeepEqual(rs.Warnings, want) {
+		t.Errorf("expected warnings %q, got %q", want, rs.Warnings)
+	}
+}
+
+func TestParsePrivateModifierRules(t *testing.T) {
+	rs := mustParse(t, `
+rule private_only {
+	strings:
+		$secret = "needle" private
+	condition:
+		$secret
+}
+
+rule mixed {
+	strings:
+		$public = "visible"
+		$secret = "needle" private
+	condition:
+		$public and $secret
+}`)
+
+	if len(rs.Warnings) != 0 {
+		t.Fatalf("expected no warnings, got %v", rs.Warnings)
+	}
+
+	privateOnly := rs.Rules[0]
+	if len(privateOnly.Strings) != 1 || !privateOnly.Strings[0].Modifiers.Private {
+		t.Fatalf("expected private-only rule to preserve private modifier, got %+v", privateOnly.Strings)
+	}
+
+	mixed := rs.Rules[1]
+	if len(mixed.Strings) != 2 {
+		t.Fatalf("expected 2 strings in mixed rule, got %d", len(mixed.Strings))
+	}
+	if mixed.Strings[0].Modifiers.Private {
+		t.Errorf("expected $public to remain public")
+	}
+	if !mixed.Strings[1].Modifiers.Private {
+		t.Errorf("expected $secret to be private")
+	}
+}
+
+func TestParseUnterminatedModifierArgs(t *testing.T) {
+	p := New()
+	_, err := p.Parse(`rule test { strings: $ = "x" xor(0x01 condition: any of them }`)
+	if err == nil {
+		t.Fatal("expected error for unterminated modifier arguments")
 	}
 }
 
@@ -263,10 +343,274 @@ func TestParseConditionWithParens(t *testing.T) {
 	}
 }
 
-// Helpers
+func TestParseFilesizeCondition(t *testing.T) {
+	tests := []struct {
+		name string
+		cond string
+		want ast.Expr
+	}{
+		{
+			name: "truthy",
+			cond: `filesize`,
+			want: ast.Filesize{},
+		},
+		{
+			name: "comparison",
+			cond: `filesize == 3`,
+			want: ast.BinaryExpr{
+				Op:    "==",
+				Left:  ast.Filesize{},
+				Right: ast.IntLit{Value: 3},
+			},
+		},
+	}
 
-func intPtr(i int) *int    { return &i }
-func bytePtr(b byte) *byte { return &b }
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rs := mustParse(t, `rule test { condition: `+tt.cond+` }`)
+			if got := rs.Rules[0].Condition; !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("condition = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseNotCondition(t *testing.T) {
+	tests := []struct {
+		name string
+		cond string
+		want ast.Expr
+	}{
+		{
+			name: "string reference",
+			cond: `not $a`,
+			want: ast.NotExpr{Inner: ast.StringRef{Name: "$a"}},
+		},
+		{
+			name: "parenthesized expression",
+			cond: `not ($a or $b)`,
+			want: ast.NotExpr{Inner: ast.ParenExpr{Inner: ast.BinaryExpr{
+				Op:    "or",
+				Left:  ast.StringRef{Name: "$a"},
+				Right: ast.StringRef{Name: "$b"},
+			}}},
+		},
+		{
+			name: "nested not",
+			cond: `not not $a`,
+			want: ast.NotExpr{Inner: ast.NotExpr{Inner: ast.StringRef{Name: "$a"}}},
+		},
+		{
+			name: "higher precedence than and",
+			cond: `not $a and $b`,
+			want: ast.BinaryExpr{
+				Op:    "and",
+				Left:  ast.NotExpr{Inner: ast.StringRef{Name: "$a"}},
+				Right: ast.StringRef{Name: "$b"},
+			},
+		},
+		{
+			name: "lower precedence than comparison",
+			cond: `not uint8(0) == 0`,
+			want: ast.NotExpr{Inner: ast.BinaryExpr{
+				Op:    "==",
+				Left:  ast.FuncCall{Name: "uint8", Args: []ast.Expr{ast.IntLit{Value: 0}}},
+				Right: ast.IntLit{Value: 0},
+			}},
+		},
+		{
+			name: "lower precedence than at",
+			cond: `not $a at 0`,
+			want: ast.NotExpr{Inner: ast.AtExpr{
+				Ref: ast.StringRef{Name: "$a"},
+				Pos: ast.IntLit{Value: 0},
+			}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rs := mustParse(t, `rule test { condition: `+tt.cond+` }`)
+			if got := rs.Rules[0].Condition; !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("condition = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseHexAltWithSpaces(t *testing.T) {
+	rs := mustParse(t, `rule test { strings: $ = { (AB | CD) EF } condition: any of them }`)
+	hex := rs.Rules[0].Strings[0].Value.(ast.HexString)
+	want := []ast.HexToken{
+		ast.HexAlt{Alternatives: []ast.HexAltItem{{Byte: new(byte(0xAB))}, {Byte: new(byte(0xCD))}}},
+		ast.HexByte{Value: 0xEF},
+	}
+	if !hexTokensEqual(hex.Tokens, want) {
+		t.Errorf("expected %v, got %v", want, hex.Tokens)
+	}
+}
+
+func TestParseUppercaseHexInt(t *testing.T) {
+	rs := mustParse(t, `rule t { condition: 0XFF }`)
+	lit, ok := rs.Rules[0].Condition.(ast.IntLit)
+	if !ok {
+		t.Fatalf("expected IntLit condition, got %T", rs.Rules[0].Condition)
+	}
+	if lit.Value != 0xFF {
+		t.Errorf("expected 255, got %d", lit.Value)
+	}
+}
+
+func TestParseComparisonConditions(t *testing.T) {
+	tests := []struct {
+		name string
+		cond string
+		want ast.Expr
+	}{
+		{
+			name: "eq",
+			cond: `uint8(0) == 1`,
+			want: ast.BinaryExpr{
+				Op:    "==",
+				Left:  ast.FuncCall{Name: "uint8", Args: []ast.Expr{ast.IntLit{Value: 0}}},
+				Right: ast.IntLit{Value: 1},
+			},
+		},
+		{
+			name: "ne",
+			cond: `uint8(0) != 1`,
+			want: ast.BinaryExpr{
+				Op:    "!=",
+				Left:  ast.FuncCall{Name: "uint8", Args: []ast.Expr{ast.IntLit{Value: 0}}},
+				Right: ast.IntLit{Value: 1},
+			},
+		},
+		{
+			name: "lt",
+			cond: `uint8(0) < 1`,
+			want: ast.BinaryExpr{
+				Op:    "<",
+				Left:  ast.FuncCall{Name: "uint8", Args: []ast.Expr{ast.IntLit{Value: 0}}},
+				Right: ast.IntLit{Value: 1},
+			},
+		},
+		{
+			name: "gt",
+			cond: `uint8(0) > 1`,
+			want: ast.BinaryExpr{
+				Op:    ">",
+				Left:  ast.FuncCall{Name: "uint8", Args: []ast.Expr{ast.IntLit{Value: 0}}},
+				Right: ast.IntLit{Value: 1},
+			},
+		},
+		{
+			name: "le",
+			cond: `uint8(0) <= 1`,
+			want: ast.BinaryExpr{
+				Op:    "<=",
+				Left:  ast.FuncCall{Name: "uint8", Args: []ast.Expr{ast.IntLit{Value: 0}}},
+				Right: ast.IntLit{Value: 1},
+			},
+		},
+		{
+			name: "ge",
+			cond: `uint8(0) >= 1`,
+			want: ast.BinaryExpr{
+				Op:    ">=",
+				Left:  ast.FuncCall{Name: "uint8", Args: []ast.Expr{ast.IntLit{Value: 0}}},
+				Right: ast.IntLit{Value: 1},
+			},
+		},
+		{
+			name: "parenthesized integer",
+			cond: `(filesize) >= 1`,
+			want: ast.BinaryExpr{
+				Op:    ">=",
+				Left:  ast.ParenExpr{Inner: ast.Filesize{}},
+				Right: ast.IntLit{Value: 1},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rs := mustParse(t, `rule test { condition: `+tt.cond+` }`)
+			if got := rs.Rules[0].Condition; !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("condition = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseComparisonPrecedence(t *testing.T) {
+	rs := mustParse(t, `rule test { condition: not uint8(0) < 1 or $a and uint8(1) >= 2 }`)
+	want := ast.BinaryExpr{
+		Op: "or",
+		Left: ast.NotExpr{Inner: ast.BinaryExpr{
+			Op:    "<",
+			Left:  ast.FuncCall{Name: "uint8", Args: []ast.Expr{ast.IntLit{Value: 0}}},
+			Right: ast.IntLit{Value: 1},
+		}},
+		Right: ast.BinaryExpr{
+			Op:    "and",
+			Left:  ast.StringRef{Name: "$a"},
+			Right: ast.BinaryExpr{Op: ">=", Left: ast.FuncCall{Name: "uint8", Args: []ast.Expr{ast.IntLit{Value: 1}}}, Right: ast.IntLit{Value: 2}},
+		},
+	}
+	if got := rs.Rules[0].Condition; !reflect.DeepEqual(got, want) {
+		t.Errorf("condition = %#v, want %#v", got, want)
+	}
+}
+
+func TestParseInvalidInputs(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		errPart string
+	}{
+		{"multi-byte hex alternative", `rule t { strings: $ = { (4142|43) } condition: any of them }`, "alternative"},
+		{"garbage hex alternative", `rule t { strings: $ = { (GG|41) } condition: any of them }`, "alternative"},
+		{"garbage hex jump", `rule t { strings: $ = { FF [1-x] 41 } condition: any of them }`, "jump"},
+		{"inverted hex jump", `rule t { strings: $ = { FF [5-2] 41 } condition: any of them }`, "jump"},
+		{"unterminated hex jump", `rule t { strings: $ = { FF [1-2 } condition: any of them }`, "unterminated"},
+		{"unterminated hex alternation", `rule t { strings: $ = { FF (41|42 } condition: any of them }`, "unterminated"},
+		{"unterminated string", `rule t { strings: $ = "abc`, "unterminated"},
+		{"unterminated regex", `rule t { strings: $ = /abc`, "unterminated"},
+		{"unterminated block comment", `rule t { /* comment`, "unterminated"},
+		{"integer overflow", `rule t { condition: 99999999999999999999 }`, "integer"},
+		{"hex integer overflow", `rule t { condition: 0xFFFFFFFFFFFFFFFFFF }`, "integer"},
+		{"unsupported bare identifier", `rule t { condition: entrypoint }`, "syntax error"},
+		{"string comparison left operand", `rule t { strings: $a = "a" condition: $a >= 0 }`, "integer operands"},
+		{"string comparison right operand", `rule t { strings: $a = "a" condition: 0 <= $a }`, "integer operands"},
+		{"quantifier comparison operand", `rule t { strings: $a = "a" condition: any of them == 1 }`, "integer operands"},
+		{"chained relational comparisons", `rule t { condition: 1 < 2 < 3 }`, "syntax error"},
+		{"chained equality comparisons", `rule t { condition: 1 == 1 == 1 }`, "syntax error"},
+		{"non-ascii whitespace", "rule t \xa0{ condition: 0 }", "unexpected character"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := New().Parse(tt.input)
+			if err == nil {
+				t.Fatal("expected parse error")
+			}
+			if !strings.Contains(err.Error(), tt.errPart) {
+				t.Errorf("expected error containing %q, got %q", tt.errPart, err.Error())
+			}
+		})
+	}
+}
+
+func TestParseErrorMessagePreserved(t *testing.T) {
+	_, err := New().Parse(`rule t { condition: @ }`)
+	if err == nil {
+		t.Fatal("expected parse error")
+	}
+	if !strings.Contains(err.Error(), "unexpected character") {
+		t.Errorf("expected descriptive lexer error to survive, got %q", err.Error())
+	}
+}
+
+// Helpers
 
 func hexTokensEqual(a, b []ast.HexToken) bool {
 	if len(a) != len(b) {
