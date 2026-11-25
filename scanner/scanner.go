@@ -192,8 +192,9 @@ func (r *Rules) ScanMem(buf []byte, flags ScanFlags, timeout time.Duration, cb S
 // are processed between context cancellation checks.
 const ctxCheckInterval = 4096
 
-// maxPooledAtoms keeps a page full of atom hits from pinning its slice in atomPool.
-const maxPooledAtoms = 64 << 10
+// maxPooledAtoms bounds the slice a scan may leave in atomPool. A megabyte of text hits common
+// atoms several hundred thousand times; a smaller cap made every large scan grow its own slice.
+const maxPooledAtoms = 1 << 20
 
 // atomPool reuses the atom hit slices of earlier scans: common atoms hit thousands of times
 // per page, and growing a new slice for every scan was most of a scan's allocation.
