@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"bytes"
 	"os"
 	"testing"
 	"time"
@@ -1840,5 +1841,64 @@ func TestScanFileMatchesScanMem(t *testing.T) {
 		if memMatches[i].Rule != fileMatches[i].Rule {
 			t.Errorf("match[%d] rule mismatch: ScanMem=%q, ScanFile=%q", i, memMatches[i].Rule, fileMatches[i].Rule)
 		}
+	}
+}
+
+type countingRegexp struct {
+	Regexp
+	calls *int
+}
+
+func (c countingRegexp) FindIndex(b []byte) []int {
+	*c.calls++
+	return c.Regexp.FindIndex(b)
+}
+
+func TestDenseAtomHits(t *testing.T) {
+	rs := &ast.RuleSet{
+		Rules: []*ast.Rule{
+			{
+				Name: "dense",
+				Strings: []*ast.StringDef{
+					{Name: "$s", Value: ast.RegexString{Pattern: `secret\.env=[0-9]{4}`}},
+				},
+				Condition: ast.AnyOf{Pattern: "them"},
+			},
+		},
+	}
+	calls := 0
+	rules, err := CompileWithOptions(rs, CompileOptions{
+		RegexCompiler: func(pattern string) (Regexp, error) {
+			re, err := experimental.CompileLatin1(pattern)
+			if err != nil {
+				return nil, err
+			}
+			return countingRegexp{re, &calls}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+
+	// Thousands of atom hits that never complete the pattern cost one pass, not one per hit.
+	noise := bytes.Repeat([]byte("secret.env "), 5000)
+	var matches MatchRules
+	if err := rules.ScanMem(noise, 0, 10*time.Second, &matches); err != nil {
+		t.Fatalf("ScanMem() error = %v", err)
+	}
+	if len(matches) != 0 {
+		t.Errorf("expected no match in noise, got %d", len(matches))
+	}
+	if calls > 4 {
+		t.Errorf("dense hits with no match took %d regex calls", calls)
+	}
+
+	// A match at the far end of a dense run is still found, with its own text.
+	matches = nil
+	if err := rules.ScanMem(append(noise, []byte("secret.env=1234")...), 0, 10*time.Second, &matches); err != nil {
+		t.Fatalf("ScanMem() error = %v", err)
+	}
+	if len(matches) != 1 || len(matches[0].Strings) != 1 || string(matches[0].Strings[0].Data) != "secret.env=1234" {
+		t.Errorf("match after a dense run not found: %+v", matches)
 	}
 }
