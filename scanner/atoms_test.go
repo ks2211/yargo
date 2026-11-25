@@ -37,6 +37,9 @@ func Test_extractAtoms(t *testing.T) {
 		{"non-capturing group", `(?:hello)`, 3, true, "hello"},
 		{"case insensitive flag", `(?i)hello`, 3, true, "hello"},
 		{"minLen 2", `ab[0-9]cd`, 2, true, "ab"},
+		{"pipe in character class is a literal", `[^>|;&]*\.claude\/settings`, 3, true, ".claude/settings"},
+		{"paren in character class is a literal", `hello[()|]+worldly`, 3, true, "worldly"},
+		{"group after class with pipe", `(tee|rm)\s+[^|]*target\.json`, 3, true, "target.json"},
 	}
 
 	for _, tt := range tests {
@@ -81,6 +84,48 @@ func Test_extractAtomsRejectsCommonKeywords(t *testing.T) {
 				t.Errorf("extractAtoms(%q, %d) ok = %v, want %v", tt.pattern, minAtomLength, ok, tt.wantOk)
 			}
 		})
+	}
+}
+
+func Test_extractAtomsUncoveredPatterns(t *testing.T) {
+	// Patterns where no atom set can cover every way the pattern matches must
+	// report no atoms, otherwise inputs matching only the uncovered part are
+	// silently missed.
+	tests := []struct {
+		name    string
+		pattern string
+	}{
+		{"common token branch", `return|malwarefunc`},
+		{"short branch", `ab|cdef`},
+		{"short branch in group", `(ab|cdef)`},
+		{"optional group only", `(abc)?`},
+		{"uncovered group without outside literal", `(return|malwarefunc)`},
+		{"empty branch", `foo|`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			atoms, ok := extractAtoms(tt.pattern, minAtomLength)
+			if ok {
+				t.Errorf("extractAtoms(%q) = %q, want no atoms", tt.pattern, atoms)
+			}
+		})
+	}
+}
+
+func Test_extractAtomsNonCapturingAlternation(t *testing.T) {
+	atoms, ok := extractAtoms(`(?:foo|barbaz)`, minAtomLength)
+	if !ok {
+		t.Fatal("expected atoms to be extracted")
+	}
+	found := make(map[string]bool)
+	for _, a := range atoms {
+		found[string(a)] = true
+	}
+	if !found["foo"] || !found["barbaz"] {
+		t.Errorf("expected atoms 'foo' and 'barbaz', got %v", found)
+	}
+	if found[":foo"] {
+		t.Errorf("group prefix leaked into atom: %v", found)
 	}
 }
 

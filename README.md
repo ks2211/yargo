@@ -8,8 +8,8 @@ Pure Go implementation of YARA, eliminating the need for go-yara/cgo dependencie
 - YARA rule parser (goyacc-based) with full syntax support
 - Multi-pattern scanner using a vendored [Aho-Corasick](ahocorasick/) automaton
 - Regex support via [go-re2](https://github.com/wasilibs/go-re2) (RE2 engine compiled to Wasm)
-- Condition evaluation: `and`, `or`, `at`, `any of`, `all of`, `uint*` functions, wildcards
-- Support for `base64` and `fullword` string modifiers
+- Condition evaluation: `and`, `or`, `not`, `at`, `any of`, `all of`, `filesize`, `uint*` functions, wildcards
+- Support for `base64`, `fullword`, `nocase`, and `private` string modifiers
 - Hex strings with wildcards (`??`), jumps (`[4-8]`), and alternations (`(AB|CD)`) compiled to regex
 - go-yara compatible scan API
 
@@ -81,12 +81,12 @@ Regexes without extractable atoms are rejected at compile time. Use `CompileOpti
 
 ## Tools
 
-The `cmd/` directory contains comparison and benchmarking tools that require [go-yara](https://github.com/hillu/go-yara) (cgo) to diff results against the reference YARA implementation.
+The `cmd/` directory contains comparison and benchmarking tools. Comparisons against the reference YARA implementation require [go-yara](https://github.com/hillu/go-yara) (cgo).
 
 - **corpus-bench** — benchmarks yargo vs go-yara scan speed over a file corpus
 - **corpus-diff** — compares rule matches between yargo and go-yara across a file corpus
 - **freq-gen** — generates byte frequency tables for atom scoring
-- **parse-bench** — benchmarks rule parsing/compilation speed
+- **parse-bench** — benchmarks rule parsing time and memory; add `-compile` to include scanner compilation
 - **regex-bench** — benchmarks regex engine performance (go-re2, stdlib, coregex)
 
 ## Current Limitations
@@ -96,24 +96,23 @@ The `cmd/` directory contains comparison and benchmarking tools that require [go
 Supported:
 - String references: `$a`, `$b`
 - Positional matching: `$a at 0`
-- Boolean operators: `and`, `or`, parentheses
-- Comparison: `==`
+- Boolean operators: `and`, `or`, `not`, parentheses
+- Comparisons: `==`, `!=`, `<`, `>`, `<=`, `>=`
+- File size: `filesize`
 - Byte functions: `uint32be(n)`, `uint16be(n)`, `uint32(n)`, `uint16(n)`, `uint8(n)`
 - Quantifiers: `any of them`, `all of them`, `any of ($prefix_*)`, `all of ($prefix_*)`
 
 Not yet supported:
-- `not`
-- `filesize`, `entrypoint`
+- `entrypoint`
 - String count/offset/length operators: `#a`, `@a`, `!a`
 - Numeric quantifiers: `2 of them`, `50% of them`
 - Loops: `for`, `of`
 - Arithmetic operators: `+`, `-`, `*`, `/`, `%`
 - Bitwise operators: `&`, `|`, `^`, `~`, `<<`, `>>`
-- Other comparisons: `!=`, `<`, `>`, `<=`, `>=`
 
 ### String Types
 
-**TextString** - Fully supported, including `base64` and `fullword` modifiers.
+**TextString** - Fully supported, including `base64`, `fullword`, `nocase`, and `private` modifiers.
 
 **RegexString** - Supported via RE2. RE2 does not support backreferences, lookahead/lookbehind, or possessive quantifiers. RE2 also limits repetition quantifiers to 1000, so patterns like `{0,4000}` must be rewritten to stay within this limit.
 
@@ -121,8 +120,8 @@ Not yet supported:
 
 ### Modifiers
 
-- **Supported**: `ascii`, `base64`, `fullword`
-- **Not yet implemented**: `wide`, `nocase`, `xor`, `base64wide`, `private`
+- **Supported**: `ascii`, `base64`, `fullword`, `nocase`, `private`
+- **Not yet implemented**: `wide`, `xor`, `base64wide`
 
 ## License
 

@@ -1,6 +1,8 @@
 package scanner
 
 import (
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -154,8 +156,44 @@ func TestSkipSubtypes(t *testing.T) {
 	}
 }
 
-func intPtr(n int) *int    { return &n }
-func bytePtr(b byte) *byte { return &b }
+func TestCompileClassifiesFilesizeAsZeroHitCapable(t *testing.T) {
+	rs := &ast.RuleSet{Rules: []*ast.Rule{
+		{Name: "filesize", Condition: ast.Filesize{}},
+		{
+			Name:      "string_only",
+			Strings:   []*ast.StringDef{{Name: "$a", Value: ast.TextString{Value: "a"}}},
+			Condition: ast.StringRef{Name: "$a"},
+		},
+		{
+			Name:    "filesize_and_string",
+			Strings: []*ast.StringDef{{Name: "$a", Value: ast.TextString{Value: "a"}}},
+			Condition: ast.BinaryExpr{
+				Op:    "and",
+				Left:  ast.Filesize{},
+				Right: ast.StringRef{Name: "$a"},
+			},
+		},
+		{
+			Name:    "filesize_or_string",
+			Strings: []*ast.StringDef{{Name: "$a", Value: ast.TextString{Value: "a"}}},
+			Condition: ast.BinaryExpr{
+				Op:    "or",
+				Left:  ast.Filesize{},
+				Right: ast.StringRef{Name: "$a"},
+			},
+		},
+	}}
+
+	rules, err := Compile(rs)
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+
+	want := []int32{0, 3}
+	if !slices.Equal(rules.zeroHitRules, want) {
+		t.Errorf("zeroHitRules = %v, want %v", rules.zeroHitRules, want)
+	}
+}
 
 func TestRegexCompilerPanicRecovery(t *testing.T) {
 	rs := &ast.RuleSet{
@@ -222,6 +260,120 @@ func TestRegexCompilerPanicRecoverySkipInvalid(t *testing.T) {
 	}
 	if len(matches) != 0 {
 		t.Errorf("expected 0 matches from panicking compiler, got %d", len(matches))
+	}
+}
+
+func TestInvalidRegex(t *testing.T) {
+	tests := []struct {
+		name  string
+		value ast.StringValue
+	}{
+		{"repetition above RE2 limit", ast.RegexString{Pattern: `lskdjf[a-z0-9]{16,4000}xyz`}},
+		{"unbalanced group", ast.RegexString{Pattern: `lskdjf(xyz`}},
+		{"comma quantifier above limit", ast.RegexString{Pattern: `lskdjf.{,4000}xyz`}},
+		{"hex jump above limit", ast.HexString{Tokens: []ast.HexToken{
+			ast.HexByte{Value: 0x61},
+			ast.HexByte{Value: 0x62},
+			ast.HexByte{Value: 0x63},
+			ast.HexJump{Min: new(0), Max: new(2000)},
+			ast.HexByte{Value: 0x64},
+		}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rs := &ast.RuleSet{
+				Rules: []*ast.Rule{
+					{
+						Name:      "bad_regex",
+						Strings:   []*ast.StringDef{{Name: "$s", Value: tt.value}},
+						Condition: ast.AnyOf{Pattern: "them"},
+					},
+				},
+			}
+
+			_, err := Compile(rs)
+			if err == nil {
+				t.Fatal("Compile() error = nil, want invalid regex error")
+			}
+			if !strings.Contains(err.Error(), "bad_regex") || !strings.Contains(err.Error(), "invalid regex") {
+				t.Errorf("Compile() error = %v, want rule name and \"invalid regex\"", err)
+			}
+
+			rules, err := CompileWithOptions(rs, CompileOptions{SkipInvalidRegex: true})
+			if err != nil {
+				t.Fatalf("CompileWithOptions(SkipInvalidRegex) error = %v", err)
+			}
+			if _, n := rules.Stats(); n != 0 {
+				t.Errorf("regex patterns = %d, want 0 (skipped)", n)
+			}
+		})
+	}
+}
+
+// TestRegexRejectedByGoSyntax covers patterns that regexp/syntax rejects but
+// the configured compiler accepts. They must compile, and match input if set.
+func TestRegexRejectedByGoSyntax(t *testing.T) {
+	tests := []struct {
+		name    string
+		pattern string
+		input   string
+	}{
+		{"raw Latin-1 byte", "abcd\xe9fgh", "xx abcd\xe9fgh yy"},
+		// atom extraction reads \C as a literal C, so only compilation is checked
+		{"RE2 any-byte escape", `abcd\Cfgh`, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rs := &ast.RuleSet{
+				Rules: []*ast.Rule{
+					{
+						Name:      "latin1_regex",
+						Strings:   []*ast.StringDef{{Name: "$s", Value: ast.RegexString{Pattern: tt.pattern}}},
+						Condition: ast.AnyOf{Pattern: "them"},
+					},
+				},
+			}
+
+			rules, err := Compile(rs)
+			if err != nil {
+				t.Fatalf("Compile() error = %v", err)
+			}
+			if _, n := rules.Stats(); n != 1 {
+				t.Fatalf("regex patterns = %d, want 1", n)
+			}
+			if tt.input == "" {
+				return
+			}
+			var matches MatchRules
+			if err := rules.ScanMem([]byte(tt.input), 0, 10*time.Second, &matches); err != nil {
+				t.Fatalf("ScanMem() error = %v", err)
+			}
+			if len(matches) != 1 {
+				t.Errorf("expected 1 match, got %d", len(matches))
+			}
+		})
+	}
+}
+
+func TestInvalidRegexCustomCompiler(t *testing.T) {
+	rs := &ast.RuleSet{
+		Rules: []*ast.Rule{
+			{
+				Name:      "custom_syntax",
+				Strings:   []*ast.StringDef{{Name: "$s", Value: ast.RegexString{Pattern: `lskdjf[a-z]{1,4000}`}}},
+				Condition: ast.AnyOf{Pattern: "them"},
+			},
+		},
+	}
+
+	// a compiler without RE2's repetition limit decides what is valid
+	_, err := CompileWithOptions(rs, CompileOptions{
+		RegexCompiler: func(pattern string) (Regexp, error) {
+			return experimental.CompileLatin1(`lskdjf[a-z]{1,40}`)
+		},
+	})
+	if err != nil {
+		t.Fatalf("CompileWithOptions() error = %v", err)
 	}
 }
 
@@ -316,12 +468,12 @@ func Test_hexStringToRegex(t *testing.T) {
 		},
 		{
 			name:   "exact jump",
-			tokens: []ast.HexToken{ast.HexByte{Value: 0x00}, ast.HexJump{Min: intPtr(4), Max: intPtr(4)}, ast.HexByte{Value: 0xFF}},
+			tokens: []ast.HexToken{ast.HexByte{Value: 0x00}, ast.HexJump{Min: new(4), Max: new(4)}, ast.HexByte{Value: 0xFF}},
 			want:   `\x00.{4}\xff`,
 		},
 		{
 			name:   "range jump",
-			tokens: []ast.HexToken{ast.HexByte{Value: 0x00}, ast.HexJump{Min: intPtr(4), Max: intPtr(8)}, ast.HexByte{Value: 0xFF}},
+			tokens: []ast.HexToken{ast.HexByte{Value: 0x00}, ast.HexJump{Min: new(4), Max: new(8)}, ast.HexByte{Value: 0xFF}},
 			want:   `\x00.{4,8}\xff`,
 		},
 		{
@@ -331,12 +483,12 @@ func Test_hexStringToRegex(t *testing.T) {
 		},
 		{
 			name:   "min only jump",
-			tokens: []ast.HexToken{ast.HexByte{Value: 0x00}, ast.HexJump{Min: intPtr(4), Max: nil}, ast.HexByte{Value: 0xFF}},
+			tokens: []ast.HexToken{ast.HexByte{Value: 0x00}, ast.HexJump{Min: new(4), Max: nil}, ast.HexByte{Value: 0xFF}},
 			want:   `\x00.{4,}\xff`,
 		},
 		{
 			name:   "max only jump",
-			tokens: []ast.HexToken{ast.HexByte{Value: 0x00}, ast.HexJump{Min: nil, Max: intPtr(8)}, ast.HexByte{Value: 0xFF}},
+			tokens: []ast.HexToken{ast.HexByte{Value: 0x00}, ast.HexJump{Min: nil, Max: new(8)}, ast.HexByte{Value: 0xFF}},
 			want:   `\x00.{0,8}\xff`,
 		},
 		{
@@ -344,8 +496,8 @@ func Test_hexStringToRegex(t *testing.T) {
 			tokens: []ast.HexToken{
 				ast.HexByte{Value: 0x00},
 				ast.HexAlt{Alternatives: []ast.HexAltItem{
-					{Byte: bytePtr(0x90)},
-					{Byte: bytePtr(0xCC)},
+					{Byte: new(byte(0x90))},
+					{Byte: new(byte(0xCC))},
 				}},
 				ast.HexByte{Value: 0xFF},
 			},
@@ -355,7 +507,7 @@ func Test_hexStringToRegex(t *testing.T) {
 			name: "alternation with wildcard",
 			tokens: []ast.HexToken{
 				ast.HexAlt{Alternatives: []ast.HexAltItem{
-					{Byte: bytePtr(0x41)},
+					{Byte: new(byte(0x41))},
 					{Wildcard: true},
 				}},
 			},
@@ -368,10 +520,10 @@ func Test_hexStringToRegex(t *testing.T) {
 				ast.HexByte{Value: 0x5A},
 				ast.HexWildcard{},
 				ast.HexWildcard{},
-				ast.HexJump{Min: intPtr(4), Max: intPtr(8)},
+				ast.HexJump{Min: new(4), Max: new(8)},
 				ast.HexAlt{Alternatives: []ast.HexAltItem{
-					{Byte: bytePtr(0x90)},
-					{Byte: bytePtr(0xCC)},
+					{Byte: new(byte(0x90))},
+					{Byte: new(byte(0xCC))},
 				}},
 			},
 			want: `\x4d\x5a.{2}.{4,8}(?:\x90|\xcc)`,
@@ -383,7 +535,7 @@ func Test_hexStringToRegex(t *testing.T) {
 		},
 		{
 			name:   "zero min jump",
-			tokens: []ast.HexToken{ast.HexByte{Value: 0x00}, ast.HexJump{Min: intPtr(0), Max: intPtr(10)}, ast.HexByte{Value: 0xFF}},
+			tokens: []ast.HexToken{ast.HexByte{Value: 0x00}, ast.HexJump{Min: new(0), Max: new(10)}, ast.HexByte{Value: 0xFF}},
 			want:   `\x00.{0,10}\xff`,
 		},
 	}

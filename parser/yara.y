@@ -31,11 +31,12 @@ import (
 %token <num> INT_LIT
 %token <byt> HEX_BYTE
 %token HEX_WILDCARD
-%token AND OR AT ANY ALL OF THEM EQ
+%token AND OR NOT AT ANY ALL OF THEM EQ NE LT GT LE GE FILESIZE
 
 %left OR
 %left AND
-%left EQ
+%right NOT
+%nonassoc EQ NE LT GT LE GE
 %nonassoc AT
 
 %type <rules> rule_list
@@ -195,8 +196,15 @@ modifiers:
 			$$.Base64 = true
 		case "fullword":
 			$$.Fullword = true
+		case "nocase":
+			$$.Nocase = true
+		case "private":
+			$$.Private = true
 		default:
-			yylex.Error("unsupported modifier: " + $2)
+			// known-but-unimplemented (wide, xor, ...), argument forms of
+			// supported modifiers, or future modifiers; recorded so the
+			// rule is skipped at compile time and reported as a warning
+			$$.Unsupported = append($$.Unsupported, $2)
 		}
 	}
 	;
@@ -223,11 +231,19 @@ hex_token:
 	}
 	| HEX_JUMP
 	{
-		$$ = parseHexJump($1)
+		jump, err := parseHexJump($1)
+		if err != nil {
+			yylex.Error(err.Error())
+		}
+		$$ = jump
 	}
 	| HEX_ALT
 	{
-		$$ = parseHexAlt($1)
+		alt, err := parseHexAlt($1)
+		if err != nil {
+			yylex.Error(err.Error())
+		}
+		$$ = alt
 	}
 	;
 
@@ -251,9 +267,33 @@ expr:
 	{
 		$$ = ast.BinaryExpr{Op: "and", Left: $1, Right: $3}
 	}
+	| NOT expr
+	{
+		$$ = ast.NotExpr{Inner: $2}
+	}
 	| expr EQ expr
 	{
-		$$ = ast.BinaryExpr{Op: "==", Left: $1, Right: $3}
+		$$ = comparisonExpr(yylex, "==", $1, $3)
+	}
+	| expr NE expr
+	{
+		$$ = comparisonExpr(yylex, "!=", $1, $3)
+	}
+	| expr LT expr
+	{
+		$$ = comparisonExpr(yylex, "<", $1, $3)
+	}
+	| expr GT expr
+	{
+		$$ = comparisonExpr(yylex, ">", $1, $3)
+	}
+	| expr LE expr
+	{
+		$$ = comparisonExpr(yylex, "<=", $1, $3)
+	}
+	| expr GE expr
+	{
+		$$ = comparisonExpr(yylex, ">=", $1, $3)
 	}
 	;
 
@@ -293,6 +333,10 @@ primary_expr:
 	| INT_LIT
 	{
 		$$ = ast.IntLit{Value: $1}
+	}
+	| FILESIZE
+	{
+		$$ = ast.Filesize{}
 	}
 	;
 

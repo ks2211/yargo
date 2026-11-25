@@ -2,6 +2,8 @@ package scanner
 
 import (
 	"bytes"
+	"slices"
+	"strings"
 )
 
 // commonTokens are tokens too prevalent in code to be useful as atoms.
@@ -24,16 +26,21 @@ type altGroup struct {
 // For patterns with nested alternations like "prefix(a|b|c)suffix", returns
 // atoms from all branches of the alternation when they're the best choice.
 // Returns the atoms and whether any were found meeting minLen.
+//
+// The returned atoms must COVER the pattern: every possible match contains at
+// least one atom. Atoms from inside one alternation branch or an optional
+// group don't cover matches taking another path, so patterns without a
+// required literal or a fully covered alternation group yield no atoms.
 func extractAtoms(pattern string, minLen int) ([][]byte, bool) {
 	if hasTopLevelAlternation(pattern) {
 		return extractAlternationAtoms(pattern, minLen)
 	}
 
-	// Find all literal runs and check for nested alternations
-	runs := extractLiteralRuns(pattern)
+	// Atoms covering every branch of a non-optional alternation group.
 	altAtoms := extractNestedAlternationAtoms(pattern, minLen)
 
-	// Find best atom from OUTSIDE alternation groups (the required literals)
+	// Find best atom from OUTSIDE alternation and optional groups (the
+	// required literals).
 	outsideRuns := extractLiteralRunsOutsideAlternations(pattern)
 	bestOutside := findBestRun(outsideRuns, minLen)
 
@@ -51,12 +58,7 @@ func extractAtoms(pattern string, minLen int) ([][]byte, bool) {
 		return [][]byte{bestOutside}, true
 	}
 
-	// Fall back to best overall atom
-	best := findBestRun(runs, minLen)
-	if best == nil {
-		return nil, false
-	}
-	return [][]byte{best}, true
+	return nil, false
 }
 
 // findBestRun returns the highest quality run meeting minLen, or nil if none qualify.
@@ -97,6 +99,9 @@ func hasTopLevelAlternation(s string) bool {
 		switch s[i] {
 		case '\\':
 			i++
+		case '[':
+			// (, ) and | are literals inside a character class
+			i = skipCharClass(s, i) - 1
 		case '(':
 			depth++
 		case ')':
@@ -110,16 +115,17 @@ func hasTopLevelAlternation(s string) bool {
 	return false
 }
 
-// extractAlternationAtoms extracts atoms from each branch of a top-level alternation.
+// extractAlternationAtoms extracts atoms from each branch of a top-level
+// alternation. Every branch must yield atoms, otherwise inputs matching only
+// the atom-less branch would never be verified.
 func extractAlternationAtoms(pattern string, minLen int) ([][]byte, bool) {
 	var atoms [][]byte
 	for _, branch := range splitAlternation(pattern) {
-		if best := findBestRun(extractLiteralRuns(branch), minLen); best != nil {
-			atoms = append(atoms, best)
+		branchAtoms, ok := extractAtoms(branch, minLen)
+		if !ok {
+			return nil, false
 		}
-	}
-	if len(atoms) == 0 {
-		return nil, false
+		atoms = append(atoms, branchAtoms...)
 	}
 	return atoms, true
 }
@@ -158,19 +164,25 @@ func extractNestedAlternationAtoms(pattern string, minLen int) [][]byte {
 		if isOptional(g) {
 			continue
 		}
+		// Only a group where EVERY branch yields atoms covers the pattern;
+		// skip groups with an atom-less branch.
 		var atoms [][]byte
 		bestQuality := -1
-		branches := splitAlternation(g.content)
-		for _, branch := range branches {
-			runs := extractLiteralRuns(branch)
-			if atom := findBestRun(runs, minLen); atom != nil {
+		covered := true
+		for _, branch := range splitAlternation(g.content) {
+			branchAtoms, ok := extractAtoms(branch, minLen)
+			if !ok {
+				covered = false
+				break
+			}
+			for _, atom := range branchAtoms {
 				atoms = append(atoms, atom)
 				if q := atomQuality(atom); q > bestQuality {
 					bestQuality = q
 				}
 			}
 		}
-		if len(atoms) == 0 {
+		if !covered {
 			continue
 		}
 		if best == nil || bestQuality > best.bestQuality {
@@ -193,6 +205,9 @@ func findAlternationGroups(pattern string) []altGroup {
 		switch pattern[i] {
 		case '\\':
 			i++ // skip escaped char
+		case '[':
+			// (, ) and | are literals inside a character class
+			i = skipCharClass(pattern, i) - 1
 		case '(':
 			stack = append(stack, i)
 		case ')':
@@ -202,12 +217,32 @@ func findAlternationGroups(pattern string) []altGroup {
 				content := pattern[start+1 : i]
 				// Check if this group contains alternation at its level
 				if hasTopLevelAlternation(content) {
-					groups = append(groups, altGroup{start, i, content})
+					groups = append(groups, altGroup{start, i, groupBranchContent(content)})
 				}
 			}
 		}
 	}
 	return groups
+}
+
+// groupBranchContent strips a non-capturing/flags prefix like "?:" or "?i:"
+// from group content so it doesn't leak into branch literals. Prefixed groups
+// without a flags separator (e.g. named groups) return "" so the group is
+// treated as uncovered while still being excluded from outside literals.
+func groupBranchContent(content string) string {
+	if !strings.HasPrefix(content, "?") {
+		return content
+	}
+	colon := strings.IndexByte(content, ':')
+	if colon == -1 {
+		return ""
+	}
+	for _, c := range content[1:colon] {
+		if !strings.ContainsRune("imsU-", c) {
+			return ""
+		}
+	}
+	return content[colon+1:]
 }
 
 // splitAlternation splits a string by | at depth 0.
@@ -219,6 +254,9 @@ func splitAlternation(s string) []string {
 		switch s[i] {
 		case '\\':
 			i++
+		case '[':
+			// (, ) and | are literals inside a character class
+			i = skipCharClass(s, i) - 1
 		case '(':
 			depth++
 		case ')':
@@ -249,16 +287,14 @@ func extractLiteralRunsOutsideAlternations(pattern string) [][]byte {
 	modified := []byte(pattern)
 
 	// Replace alternation groups
-	for i := len(altGroups) - 1; i >= 0; i-- {
-		g := altGroups[i]
+	for _, g := range slices.Backward(altGroups) {
 		for j := g.start; j <= g.end && j < len(modified); j++ {
 			modified[j] = '.'
 		}
 	}
 
 	// Replace optional groups
-	for i := len(optGroups) - 1; i >= 0; i-- {
-		g := optGroups[i]
+	for _, g := range slices.Backward(optGroups) {
 		for j := g.start; j <= g.end && j < len(modified); j++ {
 			modified[j] = '.'
 		}
@@ -277,6 +313,9 @@ func findOptionalGroups(pattern string) []altGroup {
 		switch pattern[i] {
 		case '\\':
 			i++ // skip escaped char
+		case '[':
+			// (, ) and | are literals inside a character class
+			i = skipCharClass(pattern, i) - 1
 		case '(':
 			stack = append(stack, i)
 		case ')':

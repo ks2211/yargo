@@ -4,6 +4,9 @@ package ast
 // RuleSet represents a collection of YARA rules.
 type RuleSet struct {
 	Rules []*Rule
+	// Warnings lists constructs that parsed but cannot be honored, such as
+	// unsupported string modifiers. The affected rules never match.
+	Warnings []string
 }
 
 // Rule represents a single YARA rule.
@@ -32,6 +35,12 @@ type StringModifiers struct {
 	Ascii    bool
 	Base64   bool
 	Fullword bool
+	Nocase   bool
+	Private  bool
+	// Unsupported holds modifiers the scanner cannot honor (e.g. wide, xor,
+	// or base64 with a custom alphabet). Compilation skips rules that use
+	// them, since matching without the modifier would be wrong.
+	Unsupported []string
 }
 
 // StringValue is an interface for the different string types.
@@ -134,6 +143,11 @@ type IntLit struct {
 
 func (IntLit) exprNode() {}
 
+// Filesize represents the bare filesize condition expression.
+type Filesize struct{}
+
+func (Filesize) exprNode() {}
+
 // FuncCall represents a function call like uint32be(0).
 type FuncCall struct {
 	Name string
@@ -142,7 +156,7 @@ type FuncCall struct {
 
 func (FuncCall) exprNode() {}
 
-// BinaryExpr represents a binary operation (and, or, ==).
+// BinaryExpr represents a binary operation like and, or, or an integer comparison.
 type BinaryExpr struct {
 	Op    string
 	Left  Expr
@@ -150,6 +164,13 @@ type BinaryExpr struct {
 }
 
 func (BinaryExpr) exprNode() {}
+
+// NotExpr represents a negated condition like "not $foo".
+type NotExpr struct {
+	Inner Expr
+}
+
+func (NotExpr) exprNode() {}
 
 // ParenExpr represents a parenthesized expression.
 type ParenExpr struct {
