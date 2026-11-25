@@ -99,6 +99,9 @@ func hasTopLevelAlternation(s string) bool {
 		switch s[i] {
 		case '\\':
 			i++
+		case '[':
+			// (, ) and | are literals inside a character class
+			i = skipCharClass(s, i) - 1
 		case '(':
 			depth++
 		case ')':
@@ -202,6 +205,9 @@ func findAlternationGroups(pattern string) []altGroup {
 		switch pattern[i] {
 		case '\\':
 			i++ // skip escaped char
+		case '[':
+			// (, ) and | are literals inside a character class
+			i = skipCharClass(pattern, i) - 1
 		case '(':
 			stack = append(stack, i)
 		case ')':
@@ -248,6 +254,9 @@ func splitAlternation(s string) []string {
 		switch s[i] {
 		case '\\':
 			i++
+		case '[':
+			// (, ) and | are literals inside a character class
+			i = skipCharClass(s, i) - 1
 		case '(':
 			depth++
 		case ')':
@@ -304,6 +313,9 @@ func findOptionalGroups(pattern string) []altGroup {
 		switch pattern[i] {
 		case '\\':
 			i++ // skip escaped char
+		case '[':
+			// (, ) and | are literals inside a character class
+			i = skipCharClass(pattern, i) - 1
 		case '(':
 			stack = append(stack, i)
 		case ')':

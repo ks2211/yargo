@@ -37,6 +37,9 @@ func Test_extractAtoms(t *testing.T) {
 		{"non-capturing group", `(?:hello)`, 3, true, "hello"},
 		{"case insensitive flag", `(?i)hello`, 3, true, "hello"},
 		{"minLen 2", `ab[0-9]cd`, 2, true, "ab"},
+		{"pipe in character class is a literal", `[^>|;&]*\.claude\/settings`, 3, true, ".claude/settings"},
+		{"paren in character class is a literal", `hello[()|]+worldly`, 3, true, "worldly"},
+		{"group after class with pipe", `(tee|rm)\s+[^|]*target\.json`, 3, true, "target.json"},
 	}
 
 	for _, tt := range tests {
